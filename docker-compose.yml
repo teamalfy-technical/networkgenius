@@ -1,0 +1,78 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mikrotik-api
+    ports:
+      - "3000:3000"
+    environment:
+      # Server config
+      PORT: 3000
+      NODE_ENV: production
+      JWT_SECRET: ${JWT_SECRET:-change-this-secret-key-in-production}
+      
+      # MikroTik router config
+      MIKROTIK_HOST: ${MIKROTIK_HOST:-192.168.1.1}
+      MIKROTIK_PORT: ${MIKROTIK_PORT:-8728}
+      MIKROTIK_USER: ${MIKROTIK_USER:-admin}
+      MIKROTIK_PASSWORD: ${MIKROTIK_PASSWORD:-password}
+      
+      # PostgreSQL config
+      DATABASE_URL: ${DOCKER_DATABASE_URL:-postgres://mikrotik:mikrotik@postgres:5432/mikrotik}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - mikrotik-network
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://localhost:3000/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: mikrotik-api-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mikrotik}
+      POSTGRES_USER: ${POSTGRES_USER:-mikrotik}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mikrotik}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - mikrotik-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Optional: Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: mikrotik-api-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+    networks:
+      - mikrotik-network
+    restart: unless-stopped
+
+networks:
+  mikrotik-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
