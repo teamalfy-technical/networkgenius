@@ -54,6 +54,11 @@ export class MikroTikClient {
         user: this.config.user,
         password: this.config.password,
         port: this.config.port,
+        tls: this.config.tls
+          ? {
+              rejectUnauthorized: true,
+            }
+          : undefined,
         timeout: 10,
         keepalive: true,
       });
@@ -118,7 +123,7 @@ export class MikroTikClient {
     try {
       const menu = this.getApi().menu("/ip hotspot user profile");
       const profile = (await menu
-        .select(["id", "name", "sharedUsers"])
+        .select(toRouterOsFields(["id", "name", "sharedUsers"]))
         .where("name", profileName)
         .getOnly()) as RouterOSItem | null;
 
@@ -257,11 +262,11 @@ export class MikroTikClient {
   /**
    * Get active connections
    */
-  async getActiveConnections(): Promise<any[]> {
+  async getActiveConnections(): Promise<HotspotSession[]> {
     try {
-      return await this.getApi()
+      const sessions = (await this.getApi()
         .menu("/ip hotspot active")
-        .select([
+        .select(toRouterOsFields([
           "id",
           "user",
           "macAddress",
@@ -269,8 +274,20 @@ export class MikroTikClient {
           "uptime",
           "bytesIn",
           "bytesOut",
-        ])
-        .get();
+        ]))
+        .get()) as RouterOSItem[];
+
+      return sessions
+        .filter((session) => session.id && session.user && session.macAddress)
+        .map((session) => ({
+          id: session.id,
+          user: session.user,
+          macAddress: session.macAddress,
+          address: session.address,
+          uptime: session.uptime,
+          bytesIn: Number(session.bytesIn || 0),
+          bytesOut: Number(session.bytesOut || 0),
+        }));
     } catch (error) {
       throw toMikroTikError("get active connections", error);
     }
@@ -280,7 +297,7 @@ export class MikroTikClient {
     try {
       const sessions = (await this.getApi()
         .menu("/ip hotspot active")
-        .select([
+        .select(toRouterOsFields([
           "id",
           "user",
           "macAddress",
@@ -288,7 +305,7 @@ export class MikroTikClient {
           "uptime",
           "bytesIn",
           "bytesOut",
-        ])
+        ]))
         .where("user", username)
         .get()) as RouterOSItem[];
 
@@ -519,7 +536,15 @@ export class MikroTikClient {
   private async findHotspotUser(username: string): Promise<RouterOSItem | null> {
     const user = await this.getApi()
       .menu("/ip hotspot user")
-      .select(["id", "name", "profile", "disabled", "macAddress"])
+      .select(
+        toRouterOsFields([
+          "id",
+          "name",
+          "profile",
+          "disabled",
+          "macAddress",
+        ])
+      )
       .where("name", username)
       .getOnly();
 
@@ -533,7 +558,7 @@ export class MikroTikClient {
   ): Promise<RouterOSItem | null> {
     const result = await this.getApi()
       .menu(menu)
-      .select(fields)
+      .select(toRouterOsFields(fields))
       .where("address", ipAddress)
       .getOnly();
 
@@ -610,6 +635,12 @@ function normalizeMac(macAddress: string): string {
   return macAddress.trim().toUpperCase();
 }
 
+function toRouterOsFields(fields: string[]): string[] {
+  return fields.map((field) =>
+    field.replace(/[A-Z]/g, (character) => `-${character.toLowerCase()}`)
+  );
+}
+
 function validateDeviceLimit(maxDevices: number): number {
   if (!Number.isInteger(maxDevices) || maxDevices < 1) {
     throw new Error("Device limit must be a positive integer");
@@ -650,4 +681,15 @@ export function getMikroTikClient(): MikroTikClient {
     );
   }
   return clientInstance;
+}
+
+export async function verifyMikroTikCredentials(
+  config: MikroTikConfig
+): Promise<void> {
+  const client = new MikroTikClient(config);
+  try {
+    await client.connect();
+  } finally {
+    await client.disconnect().catch(() => undefined);
+  }
 }

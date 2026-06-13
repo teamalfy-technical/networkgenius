@@ -1,3 +1,5 @@
+export type UserRole = "user" | "super_admin";
+
 export interface User {
   id: string;
   username: string;
@@ -7,6 +9,7 @@ export interface User {
   createdAt: string;
   updatedAt: string;
   maxDevices: number;
+  role: UserRole;
 }
 
 export interface Device {
@@ -18,6 +21,13 @@ export interface Device {
   isConnected: boolean;
   connectedAt?: string;
   disconnectedAt?: string;
+  lastSeenAt?: string;
+  bytesIn: number;
+  bytesOut: number;
+  lastSessionId?: string;
+  lastSessionBytesIn: number;
+  lastSessionBytesOut: number;
+  discoveredBy: "mikrotik" | "manual";
   createdAt: string;
   updatedAt: string;
 }
@@ -42,6 +52,7 @@ export interface UserPayload {
   password: string;
   hotspotPassword?: string;
   maxDevices?: number;
+  role?: UserRole;
 }
 
 export interface LoginPayload {
@@ -66,4 +77,5 @@ export interface MikroTikConfig {
   user: string;
   password: string;
   port?: number;
+  tls?: boolean;
 }

@@ -10,13 +10,15 @@ services:
       # Server config
       PORT: 3000
       NODE_ENV: production
-      JWT_SECRET: ${JWT_SECRET:-change-this-secret-key-in-production}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
       
       # MikroTik router config
       MIKROTIK_HOST: ${MIKROTIK_HOST:-192.168.1.1}
       MIKROTIK_PORT: ${MIKROTIK_PORT:-8728}
-      MIKROTIK_USER: ${MIKROTIK_USER:-admin}
-      MIKROTIK_PASSWORD: ${MIKROTIK_PASSWORD:-password}
+      MIKROTIK_TLS: ${MIKROTIK_TLS:-false}
+      MIKROTIK_USER: ${MIKROTIK_USER:?MIKROTIK_USER must be set}
+      MIKROTIK_PASSWORD: ${MIKROTIK_PASSWORD:?MIKROTIK_PASSWORD must be set}
       
       # PostgreSQL config
       DATABASE_URL: ${DOCKER_DATABASE_URL:-postgres://mikrotik:mikrotik@postgres:5432/mikrotik}
@@ -41,8 +43,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-mikrotik}
       POSTGRES_USER: ${POSTGRES_USER:-mikrotik}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mikrotik}
-    ports:
-      - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     restart: unless-stopped

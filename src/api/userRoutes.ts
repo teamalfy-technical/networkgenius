@@ -2,7 +2,11 @@ import type { Context } from "elysia";
 import type { UserPayload, LoginPayload, UpdateUserPayload } from "../types";
 import { UserService } from "../services/userService";
 import { createToken, getCurrentUser, getClientIp } from "../middleware/auth";
-import { successResponse, errorResponse } from "../middleware/response";
+import {
+  successResponse,
+  errorResponse,
+  safeErrorMessage,
+} from "../middleware/response";
 
 type RouteContext = Omit<Context, "params"> & {
   params: Record<string, string | undefined>;
@@ -31,6 +35,43 @@ export const userRoutes = {
           "Validation Error"
         );
       }
+      if (body.password.length > 128) {
+        context.set.status = 400;
+        return errorResponse(
+          "Password must not exceed 128 characters",
+          "Validation Error"
+        );
+      }
+      if (
+        body.hotspotPassword &&
+        (body.hotspotPassword.length < 8 || body.hotspotPassword.length > 128)
+      ) {
+        context.set.status = 400;
+        return errorResponse(
+          "Hotspot password must be 8-128 characters",
+          "Validation Error"
+        );
+      }
+      if (
+        body.maxDevices !== undefined &&
+        (!Number.isInteger(body.maxDevices) ||
+          body.maxDevices < 1 ||
+          body.maxDevices > 20)
+      ) {
+        context.set.status = 400;
+        return errorResponse(
+          "maxDevices must be an integer between 1 and 20",
+          "Validation Error"
+        );
+      }
+      if (
+        body.role !== undefined &&
+        body.role !== "user" &&
+        body.role !== "super_admin"
+      ) {
+        context.set.status = 400;
+        return errorResponse("Invalid user role", "Validation Error");
+      }
 
       const user = await UserService.createUser(body, ip);
 
@@ -42,13 +83,14 @@ export const userRoutes = {
           email: user.email,
           isActive: user.isActive,
           maxDevices: user.maxDevices,
+          role: user.role,
           createdAt: user.createdAt,
         },
         "User created successfully"
       );
     } catch (error: any) {
       context.set.status = 400;
-      return errorResponse(error.message || "Registration failed");
+      return errorResponse(safeErrorMessage(error, "Registration failed"));
     }
   },
 
@@ -60,7 +102,12 @@ export const userRoutes = {
     try {
       const body = (await context.request.json()) as LoginPayload;
 
-      if (!body.username || !body.password) {
+      if (
+        !body.username ||
+        !body.password ||
+        body.username.length > 32 ||
+        body.password.length > 128
+      ) {
         context.set.status = 400;
         return errorResponse("Missing credentials", "Validation Error");
       }
@@ -75,7 +122,7 @@ export const userRoutes = {
         return errorResponse("Invalid credentials");
       }
 
-      const token = createToken(user.id, user.username);
+      const token = createToken(user.id, user.username, user.role);
 
       return successResponse(
         {
@@ -86,13 +133,14 @@ export const userRoutes = {
             email: user.email,
             isActive: user.isActive,
             maxDevices: user.maxDevices,
+            role: user.role,
           },
         },
         "Login successful"
       );
     } catch (error: any) {
       context.set.status = 500;
-      return errorResponse(error.message || "Login failed");
+      return errorResponse(safeErrorMessage(error, "Login failed"));
     }
   },
 
@@ -123,13 +171,14 @@ export const userRoutes = {
         email: userData.email,
         isActive: userData.isActive,
         maxDevices: userData.maxDevices,
+        role: userData.role,
         deviceCount,
         connectedCount,
         createdAt: userData.createdAt,
       });
     } catch (error: any) {
       context.set.status = 500;
-      return errorResponse(error.message || "Failed to get profile");
+      return errorResponse(safeErrorMessage(error, "Failed to get profile"));
     }
   },
 
@@ -157,11 +206,12 @@ export const userRoutes = {
         email: user.email,
         isActive: user.isActive,
         maxDevices: user.maxDevices,
+        role: user.role,
         createdAt: user.createdAt,
       });
     } catch (error: any) {
       context.set.status = 500;
-      return errorResponse(error.message || "Failed to get user");
+      return errorResponse(safeErrorMessage(error, "Failed to get user"));
     }
   },
 
@@ -179,8 +229,16 @@ export const userRoutes = {
 
       const body = (await context.request.json()) as UpdateUserPayload;
       const ip = getClientIp(context);
+      const updates: UpdateUserPayload = {};
+      if (body.email !== undefined) {
+        if (typeof body.email !== "string") {
+          context.set.status = 400;
+          return errorResponse("Invalid email", "Validation Error");
+        }
+        updates.email = body.email;
+      }
 
-      const updated = await UserService.updateUser(user.userId, body, ip);
+      const updated = await UserService.updateUser(user.userId, updates, ip);
 
       if (!updated) {
         context.set.status = 404;
@@ -199,7 +257,7 @@ export const userRoutes = {
       );
     } catch (error: any) {
       context.set.status = 400;
-      return errorResponse(error.message || "Update failed");
+      return errorResponse(safeErrorMessage(error, "Update failed"));
     }
   },
 
@@ -233,6 +291,13 @@ export const userRoutes = {
           "Validation Error"
         );
       }
+      if (body.oldPassword.length > 128 || body.newPassword.length > 128) {
+        context.set.status = 400;
+        return errorResponse(
+          "Password must not exceed 128 characters",
+          "Validation Error"
+        );
+      }
 
       await UserService.changePassword(
         user.userId,
@@ -244,7 +309,7 @@ export const userRoutes = {
       return successResponse(null, "Password changed successfully");
     } catch (error: any) {
       context.set.status = 400;
-      return errorResponse(error.message || "Password change failed");
+      return errorResponse(safeErrorMessage(error, "Password change failed"));
     }
   },
 
@@ -263,12 +328,13 @@ export const userRoutes = {
           email: u.email,
           isActive: u.isActive,
           maxDevices: u.maxDevices,
+          role: u.role,
           createdAt: u.createdAt,
         }))
       );
     } catch (error: any) {
       context.set.status = 500;
-      return errorResponse(error.message || "Failed to get users");
+      return errorResponse(safeErrorMessage(error, "Failed to get users"));
     }
   },
 
@@ -290,7 +356,7 @@ export const userRoutes = {
       return successResponse(null, "User deleted successfully");
     } catch (error: any) {
       context.set.status = 400;
-      return errorResponse(error.message || "Delete failed");
+      return errorResponse(safeErrorMessage(error, "Delete failed"));
     }
   },
 
@@ -306,6 +372,10 @@ export const userRoutes = {
         return errorResponse("Missing user ID", "Validation Error");
       }
       const body = (await context.request.json()) as { isActive: boolean };
+      if (typeof body.isActive !== "boolean") {
+        context.set.status = 400;
+        return errorResponse("isActive must be a boolean", "Validation Error");
+      }
       const ip = getClientIp(context);
 
       const updated = await UserService.toggleUserStatus(
@@ -329,7 +399,146 @@ export const userRoutes = {
       );
     } catch (error: any) {
       context.set.status = 400;
-      return errorResponse(error.message || "Status update failed");
+      return errorResponse(safeErrorMessage(error, "Status update failed"));
+    }
+  },
+
+  mikrotikLogin: async (context: Context) => {
+    try {
+      const body = (await context.request.json()) as {
+        username: string;
+        password: string;
+        email?: string;
+      };
+      if (
+        !body.username ||
+        !body.password ||
+        body.username.length > 32 ||
+        body.password.length > 128
+      ) {
+        context.set.status = 400;
+        return errorResponse("Missing credentials", "Validation Error");
+      }
+
+      const user = await UserService.authenticateMikroTikSuperAdmin(
+        body.username,
+        body.password,
+        body.email,
+        getClientIp(context)
+      );
+      const token = createToken(user.id, user.username, user.role);
+      return successResponse(
+        {
+          token,
+          user: {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            role: user.role,
+          },
+        },
+        "MikroTik super-admin login successful"
+      );
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.message === "Email is required for first MikroTik admin login" ||
+          error.message === "Email already exists")
+      ) {
+        context.set.status = 400;
+        return errorResponse(error.message, "Validation Error");
+      }
+      context.set.status = 401;
+      return errorResponse("Invalid MikroTik credentials");
+    }
+  },
+
+  /**
+   * Change a user's maximum concurrent HotSpot devices (admin only)
+   * PUT /api/users/:userId/device-limit
+   */
+  updateDeviceLimit: async (context: RouteContext) => {
+    try {
+      const userId = context.params.userId;
+      if (!userId) {
+        context.set.status = 400;
+        return errorResponse("Missing user ID", "Validation Error");
+      }
+
+      const body = (await context.request.json()) as { maxDevices: number };
+      if (
+        !Number.isInteger(body.maxDevices) ||
+        body.maxDevices < 1 ||
+        body.maxDevices > 20
+      ) {
+        context.set.status = 400;
+        return errorResponse(
+          "maxDevices must be an integer between 1 and 20",
+          "Validation Error"
+        );
+      }
+
+      const updated = await UserService.updateUser(
+        userId,
+        { maxDevices: body.maxDevices },
+        getClientIp(context)
+      );
+      if (!updated) {
+        context.set.status = 404;
+        return errorResponse("User not found");
+      }
+
+      return successResponse(
+        {
+          id: updated.id,
+          username: updated.username,
+          maxDevices: updated.maxDevices,
+        },
+        "Device limit updated"
+      );
+    } catch (error: any) {
+      context.set.status = 400;
+      return errorResponse(
+        safeErrorMessage(error, "Device limit update failed")
+      );
+    }
+  },
+
+  updateRole: async (context: RouteContext) => {
+    try {
+      const userId = context.params.userId;
+      const body = (await context.request.json()) as {
+        role: "user" | "super_admin";
+      };
+      if (
+        !userId ||
+        (body.role !== "user" && body.role !== "super_admin")
+      ) {
+        context.set.status = 400;
+        return errorResponse("Invalid user role", "Validation Error");
+      }
+
+      const updated = await UserService.updateUserRole(
+        userId,
+        body.role,
+        getClientIp(context)
+      );
+      if (!updated) {
+        context.set.status = 404;
+        return errorResponse("User not found");
+      }
+
+      return successResponse(
+        {
+          id: updated.id,
+          username: updated.username,
+          role: updated.role,
+        },
+        "User role updated"
+      );
+    } catch (error) {
+      context.set.status = 400;
+      return errorResponse(safeErrorMessage(error, "Role update failed"));
     }
   },
 };

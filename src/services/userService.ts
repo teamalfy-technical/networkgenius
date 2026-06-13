@@ -1,7 +1,13 @@
 import bcrypt from "bcryptjs";
 import type { User, UserPayload, UpdateUserPayload } from "../types";
 import { UserQueries, DeviceQueries, AuditLogQueries } from "../database/queries";
-import { getMikroTikClient } from "../mikrotik/client";
+import {
+  getMikroTikClient,
+  verifyMikroTikCredentials,
+} from "../mikrotik/client";
+
+const DUMMY_PASSWORD_HASH =
+  "$2a$12$zQ4C8fVbI4Wq5j8jG7B6BuzvLJ1PpQF8iG2CwQjYQTKv8QxLwYgJi";
 
 export class UserService {
   /**
@@ -13,6 +19,7 @@ export class UserService {
   ): Promise<User> {
     const maxDevices = validateDeviceLimit(payload.maxDevices ?? 2);
     const username = normalizeUsername(payload.username);
+    const email = normalizeEmail(payload.email);
 
     // Check if user already exists
     const existing = await UserQueries.getByUsername(username);
@@ -20,39 +27,42 @@ export class UserService {
       throw new Error("Username already exists");
     }
 
-    const emailExists = await UserQueries.getByEmail(payload.email);
+    const emailExists = await UserQueries.getByEmail(email);
     if (emailExists) {
       throw new Error("Email already exists");
     }
 
     // Hash password
-    const passwordHash = await bcrypt.hash(payload.password, 10);
+    const passwordHash = await bcrypt.hash(payload.password, 12);
 
     // Create user in database
     const now = new Date().toISOString();
     const user = await UserQueries.create({
       username,
-      email: payload.email,
+      email,
       passwordHash,
       isActive: true,
       createdAt: now,
       updatedAt: now,
       maxDevices,
+      role: payload.role || "user",
     });
 
-    // A database account without matching HotSpot credentials cannot provide
-    // internet access, so roll it back when router provisioning fails.
-    try {
-      const mikrotik = getMikroTikClient();
-      const profile = await mikrotik.ensureDeviceLimitProfile(maxDevices);
-      await mikrotik.createHotspotUser(
-        username,
-        payload.hotspotPassword || payload.password,
-        profile
-      );
-    } catch (error) {
-      await UserQueries.delete(user.id);
-      throw error;
+    if (user.role === "user") {
+      // A user account without matching HotSpot credentials cannot provide
+      // internet access, so roll it back when router provisioning fails.
+      try {
+        const mikrotik = getMikroTikClient();
+        const profile = await mikrotik.ensureDeviceLimitProfile(maxDevices);
+        await mikrotik.createHotspotUser(
+          username,
+          payload.hotspotPassword || payload.password,
+          profile
+        );
+      } catch (error) {
+        await UserQueries.delete(user.id);
+        throw error;
+      }
     }
 
     // Log action
@@ -88,13 +98,76 @@ export class UserService {
     password: string
   ): Promise<User | null> {
     const user = await UserQueries.getByUsername(normalizeUsername(username));
-    if (!user) return null;
+    const isPasswordValid = await bcrypt.compare(
+      password,
+      user?.passwordHash || DUMMY_PASSWORD_HASH
+    );
+    if (!user || !user.isActive || !isPasswordValid) return null;
 
-    if (!user.isActive) return null;
+    return user;
+  }
 
-    const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
-    if (!isPasswordValid) return null;
+  static async authenticateMikroTikSuperAdmin(
+    usernameInput: string,
+    password: string,
+    emailInput: string | undefined,
+    requestIp: string
+  ): Promise<User> {
+    const primaryRouterUser = process.env.MIKROTIK_USER || "admin";
+    if (usernameInput !== primaryRouterUser) {
+      throw new Error("Invalid MikroTik credentials");
+    }
 
+    const username = normalizeUsername(usernameInput);
+    await verifyMikroTikCredentials({
+      host: process.env.MIKROTIK_HOST || "192.168.88.1",
+      port: Number(process.env.MIKROTIK_PORT || 8728),
+      tls: process.env.MIKROTIK_TLS === "true",
+      user: usernameInput,
+      password,
+    });
+
+    const existing = await UserQueries.getByUsername(username);
+    const passwordHash = await bcrypt.hash(password, 12);
+    let user: User;
+
+    if (existing) {
+      user =
+        (await UserQueries.update(existing.id, {
+          passwordHash,
+          isActive: true,
+          role: "super_admin",
+          ...(emailInput ? { email: normalizeEmail(emailInput) } : {}),
+        })) || existing;
+    } else {
+      if (!emailInput) {
+        throw new Error("Email is required for first MikroTik admin login");
+      }
+      const email = normalizeEmail(emailInput);
+      const emailExists = await UserQueries.getByEmail(email);
+      if (emailExists) {
+        throw new Error("Email already exists");
+      }
+
+      const now = new Date().toISOString();
+      user = await UserQueries.create({
+        username,
+        email,
+        passwordHash,
+        isActive: true,
+        maxDevices: 1,
+        role: "super_admin",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    await AuditLogQueries.log(
+      user.id,
+      "MIKROTIK_SUPER_ADMIN_LOGIN",
+      `RouterOS user: ${username}`,
+      requestIp
+    );
     return user;
   }
 
@@ -111,6 +184,7 @@ export class UserService {
 
     // Check for email conflicts
     if (updates.email && updates.email !== user.email) {
+      updates.email = normalizeEmail(updates.email);
       const emailExists = await UserQueries.getByEmail(updates.email);
       if (emailExists) {
         throw new Error("Email already exists");
@@ -150,13 +224,21 @@ export class UserService {
   static async deleteUser(userId: string, requestIp: string): Promise<void> {
     const user = await UserQueries.getById(userId);
     if (!user) throw new Error("User not found");
+    if (
+      user.role === "super_admin" &&
+      (await UserQueries.countActiveSuperAdmins()) <= 1
+    ) {
+      throw new Error("Cannot delete the last active super admin");
+    }
 
     // Remove from MikroTik
-    try {
-      const mikrotik = getMikroTikClient();
-      await mikrotik.removeHotspotUser(user.username);
-    } catch (error) {
-      console.error("Failed to remove hotspot user:", error);
+    if (user.role === "user") {
+      try {
+        const mikrotik = getMikroTikClient();
+        await mikrotik.removeHotspotUser(user.username);
+      } catch (error) {
+        console.error("Failed to remove hotspot user:", error);
+      }
     }
 
     // Delete user and devices
@@ -189,7 +271,7 @@ export class UserService {
     }
 
     // Hash new password
-    const newPasswordHash = await bcrypt.hash(newPassword, 10);
+    const newPasswordHash = await bcrypt.hash(newPassword, 12);
 
     // Update database
     await UserQueries.update(userId, { passwordHash: newPasswordHash });
@@ -229,6 +311,13 @@ export class UserService {
   ): Promise<User | null> {
     const user = await UserQueries.getById(userId);
     if (!user) return null;
+    if (
+      user.role === "super_admin" &&
+      !isActive &&
+      (await UserQueries.countActiveSuperAdmins()) <= 1
+    ) {
+      throw new Error("Cannot disable the last active super admin");
+    }
 
     const updated = await UserQueries.update(userId, { isActive });
 
@@ -247,6 +336,32 @@ export class UserService {
       requestIp
     );
 
+    return updated;
+  }
+
+  static async updateUserRole(
+    userId: string,
+    role: "user" | "super_admin",
+    requestIp: string
+  ): Promise<User | null> {
+    const user = await UserQueries.getById(userId);
+    if (!user) return null;
+    if (
+      user.role === "super_admin" &&
+      role === "user" &&
+      user.isActive &&
+      (await UserQueries.countActiveSuperAdmins()) <= 1
+    ) {
+      throw new Error("Cannot demote the last active super admin");
+    }
+
+    const updated = await UserQueries.update(userId, { role });
+    await AuditLogQueries.log(
+      userId,
+      "USER_ROLE_UPDATED",
+      `Role: ${role}`,
+      requestIp
+    );
     return updated;
   }
 
@@ -299,8 +414,22 @@ function validateDeviceLimit(maxDevices: number): number {
 
 function normalizeUsername(username: string): string {
   const normalized = username.trim().toLowerCase();
-  if (!normalized) {
-    throw new Error("Username is required");
+  if (!/^[a-z0-9][a-z0-9._-]{2,31}$/.test(normalized)) {
+    throw new Error(
+      "Username must be 3-32 lowercase letters, numbers, dots, underscores, or hyphens"
+    );
+  }
+
+  return normalized;
+}
+
+function normalizeEmail(email: string): string {
+  const normalized = email.trim().toLowerCase();
+  if (
+    normalized.length > 254 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)
+  ) {
+    throw new Error("Invalid email address");
   }
 
   return normalized;

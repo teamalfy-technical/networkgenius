@@ -43,19 +43,32 @@ bun run dev
 ## API Quick Reference
 
 ### Authentication
-- `POST /api/auth/register` - Register new user
+- `POST /api/auth/mikrotik-login` - Primary super-admin login using RouterOS credentials
+- `POST /api/auth/register` - Create account (super-admin JWT required)
 - `POST /api/auth/login` - Login and get JWT token
 
 ### User Endpoints
 - `GET /api/users/me` - Get current user profile
 - `PUT /api/users/me` - Update profile
 - `POST /api/users/change-password` - Change password
+- `PUT /api/users/:userId/device-limit` - Change limit (super-admin JWT)
+
+### Super-Admin Endpoints
+- `GET /api/admin/devices?status=all` - All registered devices
+- `GET /api/admin/devices?status=connected` - Connected devices
+- `GET /api/admin/devices?status=disconnected` - Disconnected devices
+- `GET /api/admin/sessions` - Every live MikroTik HotSpot session
+- `POST /api/admin/sessions/:sessionId/disconnect` - Terminate any live session
+- `POST /api/admin/devices/:deviceId/disconnect` - Disconnect any registered device
+- `DELETE /api/admin/devices/:deviceId` - Delete any registered device
+- `PUT /api/users/:userId/device-limit` - Change any user's device limit
+- `PUT /api/users/:userId/status` - Enable or disable a user
+- `PUT /api/users/:userId/role` - Promote or demote a user
 
 ### Device Endpoints
 - `GET /api/devices` - Get user's devices
 - `GET /api/devices/sessions` - Monitor live HotSpot sessions and limit usage
-- `POST /api/devices` - Register new device
-- `POST /api/devices/connect` - Connect device (login)
+- `PUT /api/devices/:deviceId` - Rename an automatically discovered device
 - `POST /api/devices/:deviceId/disconnect` - Disconnect device
 - `DELETE /api/devices/:deviceId` - Delete device
 
@@ -111,8 +124,17 @@ Changing `maxDevices` moves the HotSpot user to the matching profile and disconn
 }
 ```
 
-### Device Registration
-Device registration accepts a `deviceName` plus optional `macAddress` or `ipAddress`. If `macAddress` is omitted, the API detects it from the user's current MikroTik Hotspot active session or router network tables, preferring the request IP when available.
+### Automatic Device Discovery
+Users do not register devices manually. The API polls MikroTik HotSpot active
+sessions, matches the HotSpot username to the local account, and creates one
+device history record per account and MAC address.
+
+Each record stores connection state, current IP, first/last connection times,
+last-seen time, and cumulative upload/download byte counters. RouterOS remains
+responsible for enforcing the account's simultaneous `shared-users` limit.
+
+The default synchronization interval is 30 seconds and can be changed with
+`MIKROTIK_SYNC_INTERVAL_MS`.
 
 ### Authentication Separation
 JWT login authenticates access to this API only. MikroTik Hotspot authentication is provisioned separately through the router; registration accepts an optional `hotspotPassword` for that credential.
@@ -179,6 +201,41 @@ All protected endpoints require JWT token in Authorization header:
 ```
 Authorization: Bearer <token>
 ```
+
+Use a MikroTik RouterOS API account as the primary super-admin login. Include
+an email address on the first login so a local identity can be created:
+
+```bash
+curl -X POST http://localhost:3000/api/auth/mikrotik-login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "admin",
+    "password": "MIKROTIK_PASSWORD",
+    "email": "admin@example.com",
+  }'
+```
+
+The credentials are verified directly against RouterOS and the response returns
+a `super_admin` JWT. Later MikroTik logins only require username and password.
+
+Create an additional local super admin:
+
+```bash
+curl -X POST http://localhost:3000/api/auth/register \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer SUPER_ADMIN_TOKEN" \
+  -d '{
+    "username": "operationsadmin",
+    "email": "operations@example.com",
+    "password": "ReplaceWithAStrongPassword",
+    "role": "super_admin"
+  }'
+```
+
+Additional local super admins log in through `/api/auth/login` and do not need
+MikroTik credentials. All cross-user management endpoints require a current
+`super_admin` JWT.
+Demotion, disabling, or deletion of the last active super admin is blocked.
 
 Get token from login endpoint:
 ```bash
@@ -250,11 +307,15 @@ Logs are output to console. Configure `LOG_LEVEL` in `.env`
 
 ## Security
 
-- ✓ JWT tokens expire after 24 hours
-- ✓ Passwords hashed with bcrypt
-- ✓ SQL injection prevention via prepared statements
-- ✓ Rate limiting (recommended via reverse proxy)
-- ✓ HTTPS (recommended via reverse proxy)
+- JWT tokens expire after 24 hours and are checked against current account status.
+- Passwords are hashed with bcrypt cost 12.
+- Login and registration endpoints are rate limited.
+- Primary super-admin authentication is verified directly against RouterOS.
+- Request bodies are limited to 16 KiB and security headers are enabled.
+- SQL queries use parameter binding and IDs use cryptographic UUIDs.
+- Docker excludes environment files, runs as a non-root user, and does not publish PostgreSQL.
+- Use HTTPS at the reverse proxy. Set `TRUST_PROXY=true` only for a trusted proxy.
+- Prefer MikroTik API-SSL with `MIKROTIK_TLS=true` and port `8729`.
 
 ## Testing
 
@@ -262,6 +323,7 @@ Logs are output to console. Configure `LOG_LEVEL` in `.env`
 # Register user
 curl -X POST http://localhost:3000/api/auth/register \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer SUPER_ADMIN_TOKEN" \
   -d '{"username":"test","email":"test@test.com","password":"Test123456","hotspotPassword":"WiFiPass123","maxDevices":2}'
 
 # Login

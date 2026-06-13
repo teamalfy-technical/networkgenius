@@ -1,8 +1,13 @@
 import type { Context } from "elysia";
+import { isIP } from "node:net";
 import type { DevicePayload } from "../types";
 import { DeviceService } from "../services/deviceService";
 import { getCurrentUser, getClientIp } from "../middleware/auth";
-import { successResponse, errorResponse } from "../middleware/response";
+import {
+  successResponse,
+  errorResponse,
+  safeErrorMessage,
+} from "../middleware/response";
 
 type RouteContext = Omit<Context, "params"> & {
   params: Record<string, string | undefined>;
@@ -25,7 +30,9 @@ export const deviceRoutes = {
       return successResponse(status);
     } catch (error: any) {
       context.set.status = 500;
-      return errorResponse(error.message || "Failed to get active sessions");
+      return errorResponse(
+        safeErrorMessage(error, "Failed to get active sessions")
+      );
     }
   },
 
@@ -45,9 +52,20 @@ export const deviceRoutes = {
       const ip = getClientIp(context);
 
       // Validate input
-      if (!body.deviceName) {
+      if (!isValidDeviceName(body.deviceName)) {
         context.set.status = 400;
-        return errorResponse("Missing required fields", "Validation Error");
+        return errorResponse(
+          "deviceName must be 1-100 characters",
+          "Validation Error"
+        );
+      }
+      if (body.macAddress && !isValidMacAddress(body.macAddress)) {
+        context.set.status = 400;
+        return errorResponse("Invalid MAC address", "Validation Error");
+      }
+      if (body.ipAddress && isIP(body.ipAddress) === 0) {
+        context.set.status = 400;
+        return errorResponse("Invalid IP address", "Validation Error");
       }
 
       const device = await DeviceService.registerDevice(user.userId, body, ip);
@@ -65,7 +83,7 @@ export const deviceRoutes = {
       );
     } catch (error: any) {
       context.set.status = 400;
-      return errorResponse(error.message || "Registration failed");
+      return errorResponse(safeErrorMessage(error, "Registration failed"));
     }
   },
 
@@ -92,12 +110,16 @@ export const deviceRoutes = {
           isConnected: d.isConnected,
           connectedAt: d.connectedAt,
           disconnectedAt: d.disconnectedAt,
+          lastSeenAt: d.lastSeenAt,
+          bytesIn: d.bytesIn,
+          bytesOut: d.bytesOut,
+          discoveredBy: d.discoveredBy,
           createdAt: d.createdAt,
         }))
       );
     } catch (error: any) {
       context.set.status = 500;
-      return errorResponse(error.message || "Failed to get devices");
+      return errorResponse(safeErrorMessage(error, "Failed to get devices"));
     }
   },
 
@@ -133,11 +155,15 @@ export const deviceRoutes = {
         isConnected: device.isConnected,
         connectedAt: device.connectedAt,
         disconnectedAt: device.disconnectedAt,
+        lastSeenAt: device.lastSeenAt,
+        bytesIn: device.bytesIn,
+        bytesOut: device.bytesOut,
+        discoveredBy: device.discoveredBy,
         createdAt: device.createdAt,
       });
     } catch (error: any) {
       context.set.status = 500;
-      return errorResponse(error.message || "Failed to get device");
+      return errorResponse(safeErrorMessage(error, "Failed to get device"));
     }
   },
 
@@ -166,9 +192,21 @@ export const deviceRoutes = {
       }
 
       const body = (await context.request.json()) as Partial<DevicePayload>;
+      if (
+        body.deviceName !== undefined &&
+        !isValidDeviceName(body.deviceName)
+      ) {
+        context.set.status = 400;
+        return errorResponse(
+          "deviceName must be 1-100 characters",
+          "Validation Error"
+        );
+      }
       const ip = getClientIp(context);
+      const updates: Partial<DevicePayload> = {};
+      if (body.deviceName !== undefined) updates.deviceName = body.deviceName;
 
-      const updated = await DeviceService.updateDevice(deviceId, body, ip);
+      const updated = await DeviceService.updateDevice(deviceId, updates, ip);
 
       if (!updated) {
         context.set.status = 404;
@@ -186,7 +224,7 @@ export const deviceRoutes = {
       );
     } catch (error: any) {
       context.set.status = 400;
-      return errorResponse(error.message || "Update failed");
+      return errorResponse(safeErrorMessage(error, "Update failed"));
     }
   },
 
@@ -220,7 +258,7 @@ export const deviceRoutes = {
       return successResponse(null, "Device deleted successfully");
     } catch (error: any) {
       context.set.status = 400;
-      return errorResponse(error.message || "Delete failed");
+      return errorResponse(safeErrorMessage(error, "Delete failed"));
     }
   },
 
@@ -240,6 +278,17 @@ export const deviceRoutes = {
         macAddress: string;
         ipAddress: string;
       };
+      if (
+        !isValidMacAddress(body.macAddress) ||
+        !body.ipAddress ||
+        isIP(body.ipAddress) === 0
+      ) {
+        context.set.status = 400;
+        return errorResponse(
+          "Valid macAddress and ipAddress are required",
+          "Validation Error"
+        );
+      }
       const ip = getClientIp(context);
 
       // Check if can connect
@@ -271,7 +320,7 @@ export const deviceRoutes = {
       );
     } catch (error: any) {
       context.set.status = 400;
-      return errorResponse(error.message || "Connect failed");
+      return errorResponse(safeErrorMessage(error, "Connect failed"));
     }
   },
 
@@ -313,7 +362,7 @@ export const deviceRoutes = {
       );
     } catch (error: any) {
       context.set.status = 400;
-      return errorResponse(error.message || "Disconnect failed");
+      return errorResponse(safeErrorMessage(error, "Disconnect failed"));
     }
   },
 
@@ -338,11 +387,31 @@ export const deviceRoutes = {
           macAddress: d.macAddress,
           ipAddress: d.ipAddress,
           connectedAt: d.connectedAt,
+          lastSeenAt: d.lastSeenAt,
+          bytesIn: d.bytesIn,
+          bytesOut: d.bytesOut,
         }))
       );
     } catch (error: any) {
       context.set.status = 500;
-      return errorResponse(error.message || "Failed to get connected devices");
+      return errorResponse(
+        safeErrorMessage(error, "Failed to get connected devices")
+      );
     }
   },
 };
+
+function isValidDeviceName(deviceName: unknown): deviceName is string {
+  return (
+    typeof deviceName === "string" &&
+    deviceName.trim().length > 0 &&
+    deviceName.trim().length <= 100
+  );
+}
+
+function isValidMacAddress(macAddress: unknown): macAddress is string {
+  return (
+    typeof macAddress === "string" &&
+    /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/.test(macAddress.trim())
+  );
+}

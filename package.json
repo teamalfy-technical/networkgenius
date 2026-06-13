@@ -9,18 +9,19 @@
     "start": "bun run dist/index.js"
   },
   "dependencies": {
+    "@sinclair/typebox": "^0.34.49",
     "bcryptjs": "^2.4.3",
-    "elysia": "^0.8",
-    "jsonwebtoken": "^9.0.2",
+    "elysia": "^1.4.28",
+    "jsonwebtoken": "^9.0.3",
     "routeros-api": "^1.0.2",
     "source-map-support": "^0.5.21"
   },
   "devDependencies": {
     "@types/bun": "latest",
     "@types/bcryptjs": "^2.4.6",
-    "@types/jsonwebtoken": "^9.0.7"
+    "@types/jsonwebtoken": "^9.0.10"
   },
   "peerDependencies": {
-    "typescript": "^5"
+    "typescript": "^5.9.3"
   }
 }

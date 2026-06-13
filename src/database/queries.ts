@@ -1,8 +1,9 @@
 import { getDatabase } from "./init";
 import type { User, Device, SessionToken } from "../types";
+import { randomUUID } from "node:crypto";
 
 function createId(prefix: string): string {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  return `${prefix}_${randomUUID()}`;
 }
 
 function mapUser(row: any): User | null {
@@ -19,6 +20,10 @@ function mapDevice(row: any): Device | null {
     ? {
         ...row,
         isConnected: Boolean(row.isConnected),
+        bytesIn: Number(row.bytesIn || 0),
+        bytesOut: Number(row.bytesOut || 0),
+        lastSessionBytesIn: Number(row.lastSessionBytesIn || 0),
+        lastSessionBytesOut: Number(row.lastSessionBytesOut || 0),
       }
     : null;
 }
@@ -29,8 +34,8 @@ export const UserQueries = {
     const db = getDatabase();
     const id = createId("user");
     const [row] = await db<User[]>`
-      INSERT INTO users (id, username, email, "passwordHash", "isActive", "maxDevices", "createdAt", "updatedAt")
-      VALUES (${id}, ${user.username}, ${user.email}, ${user.passwordHash}, ${user.isActive}, ${user.maxDevices}, ${user.createdAt}, ${user.updatedAt})
+      INSERT INTO users (id, username, email, "passwordHash", "isActive", "maxDevices", role, "createdAt", "updatedAt")
+      VALUES (${id}, ${user.username}, ${user.email}, ${user.passwordHash}, ${user.isActive}, ${user.maxDevices}, ${user.role}, ${user.createdAt}, ${user.updatedAt})
       RETURNING *
     `;
 
@@ -53,7 +58,9 @@ export const UserQueries = {
 
   getByEmail: async (email: string): Promise<User | null> => {
     const db = getDatabase();
-    const [row] = await db<User[]>`SELECT * FROM users WHERE email = ${email}`;
+    const [row] = await db<User[]>`
+      SELECT * FROM users WHERE LOWER(email) = LOWER(${email})
+    `;
     return mapUser(row);
   },
 
@@ -79,6 +86,7 @@ export const UserQueries = {
         "passwordHash" = ${updatedUser.passwordHash},
         "isActive" = ${updatedUser.isActive},
         "maxDevices" = ${updatedUser.maxDevices},
+        role = ${updatedUser.role},
         "updatedAt" = ${updatedUser.updatedAt}
       WHERE id = ${id}
       RETURNING *
@@ -97,6 +105,16 @@ export const UserQueries = {
     const rows = await db<User[]>`SELECT * FROM users ORDER BY "createdAt" DESC`;
     return rows.map((row) => mapUser(row)!);
   },
+
+  countActiveSuperAdmins: async (): Promise<number> => {
+    const db = getDatabase();
+    const [result] = await db<{ count: string }[]>`
+      SELECT COUNT(*)::text AS count
+      FROM users
+      WHERE role = 'super_admin' AND "isActive" = TRUE
+    `;
+    return Number(result?.count || 0);
+  },
 };
 
 // ============ Device Queries ============
@@ -107,12 +125,17 @@ export const DeviceQueries = {
     const [row] = await db<Device[]>`
       INSERT INTO devices (
         id, "userId", "deviceName", "macAddress", "ipAddress", "isConnected",
-        "connectedAt", "disconnectedAt", "createdAt", "updatedAt"
+        "connectedAt", "disconnectedAt", "lastSeenAt", "bytesIn", "bytesOut",
+        "lastSessionId", "lastSessionBytesIn", "lastSessionBytesOut",
+        "discoveredBy", "createdAt", "updatedAt"
       )
       VALUES (
         ${id}, ${device.userId}, ${device.deviceName}, ${device.macAddress},
         ${device.ipAddress || null}, ${device.isConnected},
         ${device.connectedAt || null}, ${device.disconnectedAt || null},
+        ${device.lastSeenAt || null}, ${device.bytesIn}, ${device.bytesOut},
+        ${device.lastSessionId || null}, ${device.lastSessionBytesIn},
+        ${device.lastSessionBytesOut}, ${device.discoveredBy},
         ${device.createdAt}, ${device.updatedAt}
       )
       RETURNING *
@@ -135,10 +158,30 @@ export const DeviceQueries = {
     return mapDevice(row);
   },
 
+  getByUserIdAndMac: async (
+    userId: string,
+    macAddress: string
+  ): Promise<Device | null> => {
+    const db = getDatabase();
+    const [row] = await db<Device[]>`
+      SELECT * FROM devices
+      WHERE "userId" = ${userId} AND "macAddress" = ${macAddress}
+    `;
+    return mapDevice(row);
+  },
+
   getByUserId: async (userId: string): Promise<Device[]> => {
     const db = getDatabase();
     const rows = await db<Device[]>`
       SELECT * FROM devices WHERE "userId" = ${userId} ORDER BY "createdAt" DESC
+    `;
+    return rows.map((row) => mapDevice(row)!);
+  },
+
+  getAll: async (): Promise<Device[]> => {
+    const db = getDatabase();
+    const rows = await db<Device[]>`
+      SELECT * FROM devices ORDER BY "createdAt" DESC
     `;
     return rows.map((row) => mapDevice(row)!);
   },
@@ -167,6 +210,13 @@ export const DeviceQueries = {
         "isConnected" = ${updatedDevice.isConnected},
         "connectedAt" = ${updatedDevice.connectedAt || null},
         "disconnectedAt" = ${updatedDevice.disconnectedAt || null},
+        "lastSeenAt" = ${updatedDevice.lastSeenAt || null},
+        "bytesIn" = ${updatedDevice.bytesIn},
+        "bytesOut" = ${updatedDevice.bytesOut},
+        "lastSessionId" = ${updatedDevice.lastSessionId || null},
+        "lastSessionBytesIn" = ${updatedDevice.lastSessionBytesIn},
+        "lastSessionBytesOut" = ${updatedDevice.lastSessionBytesOut},
+        "discoveredBy" = ${updatedDevice.discoveredBy},
         "updatedAt" = ${updatedDevice.updatedAt}
       WHERE id = ${id}
       RETURNING *

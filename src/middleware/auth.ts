@@ -1,11 +1,16 @@
 import jwt from "jsonwebtoken";
 import type { Context } from "elysia";
+import { UserQueries } from "../database/queries";
+import type { UserRole } from "../types";
 
-const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key-change-in-production";
+const JWT_SECRET = requireSecret("JWT_SECRET", 32);
+const JWT_ISSUER = "mikrotik-api";
+const JWT_AUDIENCE = "mikrotik-api-users";
 
 export interface JWTPayload {
   userId: string;
   username: string;
+  role: UserRole;
   iat: number;
   exp: number;
 }
@@ -13,11 +18,20 @@ export interface JWTPayload {
 /**
  * Create JWT token for user
  */
-export function createToken(userId: string, username: string): string {
+export function createToken(
+  userId: string,
+  username: string,
+  role: UserRole
+): string {
   return jwt.sign(
-    { userId, username },
+    { userId, username, role },
     JWT_SECRET,
-    { expiresIn: "24h" }
+    {
+      algorithm: "HS256",
+      expiresIn: "24h",
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    }
   );
 }
 
@@ -26,10 +40,29 @@ export function createToken(userId: string, username: string): string {
  */
 export function verifyToken(token: string): JWTPayload | null {
   try {
-    return jwt.verify(token, JWT_SECRET) as JWTPayload;
+    return jwt.verify(token, JWT_SECRET, {
+      algorithms: ["HS256"],
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    }) as JWTPayload;
   } catch (error) {
     return null;
   }
+}
+
+export async function authenticateToken(token: string): Promise<JWTPayload | null> {
+  const payload = verifyToken(token);
+  if (!payload) return null;
+
+  const user = await UserQueries.getById(payload.userId);
+  if (!user || !user.isActive || user.username !== payload.username) {
+    return null;
+  }
+
+  return {
+    ...payload,
+    role: user.role,
+  };
 }
 
 /**
@@ -39,7 +72,7 @@ export function extractToken(authHeader: string | undefined): string | null {
   if (!authHeader) return null;
 
   const parts = authHeader.split(" ");
-  if (parts.length !== 2 || parts[0] !== "Bearer") {
+  if (parts.length !== 2 || parts[0]?.toLowerCase() !== "bearer") {
     return null;
   }
 
@@ -57,7 +90,7 @@ export function authMiddleware() {
       return context.set.status = 401;
     }
 
-    const payload = verifyToken(token);
+    const payload = await authenticateToken(token);
     if (!payload) {
       return context.set.status = 401;
     }
@@ -74,27 +107,46 @@ export function getCurrentUser(context: { store: unknown }): JWTPayload | null {
   return (context.store as any).user || null;
 }
 
+export function isSuperAdmin(context: { store: unknown }): boolean {
+  return getCurrentUser(context)?.role === "super_admin";
+}
+
 /**
  * Get client IP address
  */
 export function getClientIp(context: {
   request: Request;
   clientIp?: string;
-  server?: { requestIP?: (request: Request) => { address: string } | null };
+  server?: {
+    requestIP?: (request: Request) => { address: string } | null;
+  } | null;
 }): string {
   if (context.clientIp) {
     return context.clientIp;
   }
 
-  const forwarded = context.request.headers.get("x-forwarded-for");
-  if (forwarded) {
-    return forwarded.split(",")[0]?.trim() || "127.0.0.1";
-  }
+  if (process.env.TRUST_PROXY === "true") {
+    const forwarded = context.request.headers.get("x-forwarded-for");
+    if (forwarded) {
+      return forwarded.split(",")[0]?.trim() || "127.0.0.1";
+    }
 
-  const realIp = context.request.headers.get("x-real-ip");
-  if (realIp) {
-    return realIp;
+    const realIp = context.request.headers.get("x-real-ip");
+    if (realIp) {
+      return realIp;
+    }
   }
 
   return context.server?.requestIP?.(context.request)?.address || "127.0.0.1";
+}
+
+function requireSecret(name: string, minimumLength: number): string {
+  const value = process.env[name];
+  if (!value || value.length < minimumLength) {
+    throw new Error(
+      `${name} must be configured with at least ${minimumLength} characters`
+    );
+  }
+
+  return value;
 }

@@ -2,29 +2,49 @@ import { Elysia } from "elysia";
 import { initializeDatabase } from "./src/database/init";
 import { initializeMikroTikClient, MikroTikError } from "./src/mikrotik/client";
 import {
-  authMiddleware,
-  getCurrentUser,
   getClientIp,
   extractToken,
-  verifyToken,
+  authenticateToken,
+  isSuperAdmin,
 } from "./src/middleware/auth";
+import {
+  consumeRateLimit,
+  pruneRateLimits,
+  SECURITY_HEADERS,
+} from "./src/middleware/security";
 import { successResponse, errorResponse } from "./src/middleware/response";
 import { userRoutes } from "./src/api/userRoutes";
 import { deviceRoutes } from "./src/api/deviceRoutes";
+import { adminRoutes } from "./src/api/adminRoutes";
+import { DeviceService } from "./src/services/deviceService";
 
 // Get config from environment
 const MIKROTIK_HOST = process.env.MIKROTIK_HOST || "192.168.88.1";
 const MIKROTIK_USER = process.env.MIKROTIK_USER || "admin";
 const MIKROTIK_PASSWORD = process.env.MIKROTIK_PASSWORD || "password";
 const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || "8728");
+const MIKROTIK_TLS = process.env.MIKROTIK_TLS === "true";
 const PORT = parseInt(process.env.PORT || "3000");
-const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key-change-in-production";
 
-function setAuthenticatedUser(store: unknown, token: string) {
-  const payload = verifyToken(token);
-  if (payload) {
-    (store as any).user = payload;
-  }
+validateRuntimeConfig();
+
+async function setAuthenticatedUser(
+  store: unknown,
+  authorization: string | undefined
+): Promise<boolean> {
+  const token = extractToken(authorization);
+  if (!token) return false;
+
+  const payload = await authenticateToken(token);
+  if (!payload) return false;
+
+  (store as any).user = payload;
+  return true;
+}
+
+function reject(set: any, status: number, message: string) {
+  set.status = status;
+  return errorResponse(message);
 }
 
 function createJsonRequest(method: string, body: unknown): Request {
@@ -53,17 +73,36 @@ try {
     user: MIKROTIK_USER,
     password: MIKROTIK_PASSWORD,
     port: MIKROTIK_PORT,
+    tls: MIKROTIK_TLS,
   });
   mikrotikClient
     .connect()
-    .then(() => console.log("✅ Connected to MikroTik router"))
+    .then(async () => {
+      console.log("✅ Connected to MikroTik router");
+      await DeviceService.syncAllActiveSessions().catch(logSyncError);
+      const syncTimer = setInterval(() => {
+        DeviceService.syncAllActiveSessions().catch(logSyncError);
+      }, Number(process.env.MIKROTIK_SYNC_INTERVAL_MS || 30_000));
+      syncTimer.unref?.();
+    })
     .catch((err) => logMikroTikStartupError(err));
 } catch (error) {
   logMikroTikStartupError(error);
 }
 
 // Create Elysia app
-const app = new Elysia();
+const app = new Elysia({
+  serve: {
+    maxRequestBodySize: 16 * 1024,
+  },
+});
+
+app.onRequest(({ set }) => {
+  Object.assign(set.headers, SECURITY_HEADERS);
+});
+
+const cleanupTimer = setInterval(pruneRateLimits, 60_000);
+cleanupTimer.unref?.();
 
 function getRequestIp(request: Request): string {
   return getClientIp({ request, server: app.server as any });
@@ -75,276 +114,461 @@ app.get("/health", () =>
 );
 
 // ============ PUBLIC ROUTES ============
-app.post("/api/auth/register", ({ body, store, request }) =>
-  userRoutes.register({
+app.post("/api/auth/register", async ({
+  body,
+  store,
+  request,
+  headers,
+  set,
+}) => {
+  const authenticated = await setAuthenticatedUser(store, headers.authorization);
+  if (!(authenticated && isSuperAdmin({ store }))) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
+
+  const ip = getRequestIp(request);
+  const rateLimit = consumeRateLimit(`register:${ip}`, 20, 60 * 60 * 1000);
+  if (!rateLimit.allowed) {
+    set.headers["retry-after"] = String(rateLimit.retryAfterSeconds);
+    return reject(set, 429, "Too many account creation requests");
+  }
+
+  return userRoutes.register({
     params: {},
-    clientIp: getRequestIp(request),
+    clientIp: ip,
     request: createJsonRequest("POST", body),
-    set: { status: 201 },
+    set,
     store,
-  } as any)
-);
-app.post("/api/auth/login", ({ body, store, request }) =>
-  userRoutes.login({
+  } as any);
+});
+
+app.post("/api/auth/mikrotik-login", ({ body, store, request, set }) => {
+  const ip = getRequestIp(request);
+  const rateLimit = consumeRateLimit(
+    `mikrotik-login:${ip}`,
+    5,
+    15 * 60 * 1000
+  );
+  if (!rateLimit.allowed) {
+    set.headers["retry-after"] = String(rateLimit.retryAfterSeconds);
+    return reject(set, 429, "Too many MikroTik login attempts");
+  }
+
+  return userRoutes.mikrotikLogin({
     params: {},
-    clientIp: getRequestIp(request),
+    clientIp: ip,
     request: createJsonRequest("POST", body),
-    set: { status: 200 },
+    set,
     store,
-  } as any)
-);
+  } as any);
+});
+app.post("/api/auth/login", ({ body, store, request, set }) => {
+  const ip = getRequestIp(request);
+  const username =
+    typeof (body as any)?.username === "string"
+      ? (body as any).username.trim().toLowerCase()
+      : "unknown";
+  const rateLimit = consumeRateLimit(
+    `login:${ip}:${username}`,
+    10,
+    15 * 60 * 1000
+  );
+  const ipRateLimit = consumeRateLimit(`login-ip:${ip}`, 50, 15 * 60 * 1000);
+  if (!rateLimit.allowed || !ipRateLimit.allowed) {
+    set.headers["retry-after"] = String(
+      Math.max(rateLimit.retryAfterSeconds, ipRateLimit.retryAfterSeconds)
+    );
+    return reject(set, 429, "Too many login attempts");
+  }
+
+  return userRoutes.login({
+    params: {},
+    clientIp: ip,
+    request: createJsonRequest("POST", body),
+    set,
+    store,
+  } as any);
+});
 
 // ============ PROTECTED ROUTES - USER ENDPOINTS ============
 
 // User profile
-app.get("/api/users/me", ({ headers, store }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.get("/api/users/me", async ({ headers, store, set }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
-  return userRoutes.getProfile({ params: {}, request: new Request("http://localhost"), set: { status: 200 }, store } as any);
+  return userRoutes.getProfile({
+    params: {},
+    request: new Request("http://localhost"),
+    set,
+    store,
+  } as any);
 });
 
 // Get all users (admin)
-app.get("/api/users", ({ headers, store }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.get("/api/users", async ({ headers, store, set }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
-  return userRoutes.getAllUsers({ params: {}, request: new Request("http://localhost"), set: { status: 200 }, store } as any);
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
+  return userRoutes.getAllUsers({
+    params: {},
+    request: new Request("http://localhost"),
+    set,
+    store,
+  } as any);
 });
 
 // Get user by ID (admin)
-app.get("/api/users/:userId", ({ headers, params, store }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.get("/api/users/:userId", async ({ headers, params, store, set }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
-  return userRoutes.getUser({ params, request: new Request("http://localhost"), set: { status: 200 }, store } as any);
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
+  return userRoutes.getUser({
+    params,
+    request: new Request("http://localhost"),
+    set,
+    store,
+  } as any);
 });
 
 // Update user profile
-app.put("/api/users/me", async ({ headers, store, body }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.put("/api/users/me", async ({ headers, store, body, set, request }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
 
   const mockRequest = createJsonRequest("PUT", body);
 
   return userRoutes.updateProfile({
     params: {},
+    clientIp: getRequestIp(request),
     request: mockRequest,
-    set: { status: 200 },
+    set,
     store,
   } as any);
 });
 
 // Change password
-app.post("/api/users/change-password", async ({ headers, store, body }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.post("/api/users/change-password", async ({ headers, store, body, set, request }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
 
   const mockRequest = createJsonRequest("POST", body);
 
   return userRoutes.changePassword({
     params: {},
+    clientIp: getRequestIp(request),
     request: mockRequest,
-    set: { status: 200 },
+    set,
     store,
   } as any);
 });
 
 // Delete user (admin)
-app.delete("/api/users/:userId", ({ headers, params, store }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.delete("/api/users/:userId", async ({ headers, params, store, set, request }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
   return userRoutes.deleteUser({
     params,
-    request: new Request("http://localhost"),
-    set: { status: 200 },
+    clientIp: getRequestIp(request),
+    request,
+    set,
     store,
   } as any);
 });
 
 // Toggle user status (admin)
-app.put("/api/users/:userId/status", async ({ headers, params, store, body }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.put("/api/users/:userId/status", async ({ headers, params, store, body, set, request }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
 
   const mockRequest = createJsonRequest("PUT", body);
 
   return userRoutes.toggleUserStatus({
     params,
+    clientIp: getRequestIp(request),
     request: mockRequest,
-    set: { status: 200 },
+    set,
+    store,
+  } as any);
+});
+
+// Change device limit (admin)
+app.put("/api/users/:userId/device-limit", async ({
+  headers,
+  params,
+  store,
+  body,
+  set,
+  request,
+}) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
+  }
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
+
+  return userRoutes.updateDeviceLimit({
+    params,
+    clientIp: getRequestIp(request),
+    request: createJsonRequest("PUT", body),
+    set,
+    store,
+  } as any);
+});
+
+app.put("/api/users/:userId/role", async ({
+  headers,
+  params,
+  store,
+  body,
+  set,
+  request,
+}) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
+  }
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
+
+  return userRoutes.updateRole({
+    params,
+    clientIp: getRequestIp(request),
+    request: createJsonRequest("PUT", body),
+    set,
+    store,
+  } as any);
+});
+
+// ============ SUPER-ADMIN DEVICE AND SESSION ENDPOINTS ============
+
+app.get("/api/admin/devices", async ({ headers, store, set, query }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
+  }
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
+
+  return adminRoutes.getDevices({
+    params: {},
+    query,
+    request: new Request("http://localhost"),
+    set,
+    store,
+  } as any);
+});
+
+app.get("/api/admin/sessions", async ({ headers, store, set }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
+  }
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
+
+  return adminRoutes.getSessions({
+    params: {},
+    request: new Request("http://localhost"),
+    set,
+    store,
+  } as any);
+});
+
+app.post("/api/admin/sessions/:sessionId/disconnect", async ({
+  headers,
+  params,
+  store,
+  set,
+  request,
+}) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
+  }
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
+
+  return adminRoutes.disconnectSession({
+    params,
+    clientIp: getRequestIp(request),
+    request,
+    set,
+    store,
+  } as any);
+});
+
+app.post("/api/admin/devices/:deviceId/disconnect", async ({
+  headers,
+  params,
+  store,
+  set,
+  request,
+}) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
+  }
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
+
+  return adminRoutes.disconnectDevice({
+    params,
+    clientIp: getRequestIp(request),
+    request,
+    set,
+    store,
+  } as any);
+});
+
+app.delete("/api/admin/devices/:deviceId", async ({
+  headers,
+  params,
+  store,
+  set,
+  request,
+}) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
+  }
+  if (!isSuperAdmin({ store })) {
+    return reject(set, 403, "Super-admin credentials required");
+  }
+
+  return adminRoutes.deleteDevice({
+    params,
+    clientIp: getRequestIp(request),
+    request,
+    set,
     store,
   } as any);
 });
 
 // ============ PROTECTED ROUTES - DEVICE ENDPOINTS ============
 
-// Register device
-app.post("/api/devices", async ({ headers, store, body, request }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
-  }
-  setAuthenticatedUser(store, token);
-
-  const mockRequest = createJsonRequest("POST", body);
-
-  return deviceRoutes.registerDevice({
-    params: {},
-    clientIp: getRequestIp(request),
-    request: mockRequest,
-    set: { status: 201 },
-    store,
-  } as any);
-});
-
 // Get user devices
-app.get("/api/devices", ({ headers, store }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.get("/api/devices", async ({ headers, store, set }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
   return deviceRoutes.getUserDevices({
     params: {},
     request: new Request("http://localhost"),
-    set: { status: 200 },
+    set,
     store,
   } as any);
 });
 
 // Get connected devices
-app.get("/api/devices/connected", ({ headers, store }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.get("/api/devices/connected", async ({ headers, store, set }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
   return deviceRoutes.getConnectedDevices({
     params: {},
     request: new Request("http://localhost"),
-    set: { status: 200 },
+    set,
     store,
   } as any);
 });
 
 // Get live HotSpot session usage
-app.get("/api/devices/sessions", ({ headers, store }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.get("/api/devices/sessions", async ({ headers, store, set }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
   return deviceRoutes.getSessionStatus({
     params: {},
     request: new Request("http://localhost"),
-    set: { status: 200 },
+    set,
     store,
   } as any);
 });
 
 // Get device by ID
-app.get("/api/devices/:deviceId", ({ headers, params, store }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.get("/api/devices/:deviceId", async ({ headers, params, store, set }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
   return deviceRoutes.getDevice({
     params,
     request: new Request("http://localhost"),
-    set: { status: 200 },
+    set,
     store,
   } as any);
 });
 
 // Update device
-app.put("/api/devices/:deviceId", async ({ headers, params, store, body }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.put("/api/devices/:deviceId", async ({ headers, params, store, body, set, request }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
 
   const mockRequest = createJsonRequest("PUT", body);
 
   return deviceRoutes.updateDevice({
     params,
+    clientIp: getRequestIp(request),
     request: mockRequest,
-    set: { status: 200 },
+    set,
     store,
   } as any);
 });
 
 // Delete device
-app.delete("/api/devices/:deviceId", ({ headers, params, store }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.delete("/api/devices/:deviceId", async ({ headers, params, store, set, request }) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
   return deviceRoutes.deleteDevice({
     params,
-    request: new Request("http://localhost"),
-    set: { status: 200 },
-    store,
-  } as any);
-});
-
-// Connect device
-app.post("/api/devices/connect", async ({ headers, store, body }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
-  }
-  setAuthenticatedUser(store, token);
-
-  const mockRequest = createJsonRequest("POST", body);
-
-  return deviceRoutes.connectDevice({
-    params: {},
-    request: mockRequest,
-    set: { status: 200 },
+    clientIp: getRequestIp(request),
+    request,
+    set,
     store,
   } as any);
 });
 
 // Disconnect device
-app.post("/api/devices/:deviceId/disconnect", ({ headers, params, store }) => {
-  const token = extractToken(headers.authorization);
-  if (!token || !verifyToken(token)) {
-    return errorResponse("Unauthorized");
+app.post("/api/devices/:deviceId/disconnect", async ({
+  headers,
+  params,
+  store,
+  set,
+  request,
+}) => {
+  if (!(await setAuthenticatedUser(store, headers.authorization))) {
+    return reject(set, 401, "Unauthorized");
   }
-  setAuthenticatedUser(store, token);
   return deviceRoutes.disconnectDevice({
     params,
-    request: new Request("http://localhost"),
-    set: { status: 200 },
+    clientIp: getRequestIp(request),
+    request,
+    set,
     store,
   } as any);
 });
 
 // 404 handler
-app.all("*", ({ path }) => {
-  return errorResponse("Not found");
+app.all("*", ({ set }) => {
+  return reject(set, 404, "Not found");
 });
 
 // Start server
@@ -353,11 +577,12 @@ app.listen(PORT, () => {
   console.log("📚 API Documentation:");
   console.log(`   POST /api/auth/register - Register new user`);
   console.log(`   POST /api/auth/login - Login user`);
+  console.log(`   POST /api/auth/mikrotik-login - MikroTik super-admin login`);
   console.log(`   GET  /api/users/me - Get current user profile`);
   console.log(`   GET  /api/devices - Get user devices`);
-  console.log(`   POST /api/devices - Register new device`);
   console.log(`   GET  /api/devices/sessions - Monitor live HotSpot sessions`);
-  console.log(`   POST /api/devices/connect - Connect device`);
+  console.log(`   GET  /api/admin/devices - Super-admin device overview`);
+  console.log(`   GET  /api/admin/sessions - Super-admin active sessions`);
   console.log(`   POST /api/devices/:deviceId/disconnect - Disconnect device`);
   console.log(`   DELETE /api/devices/:deviceId - Delete device`);
 });
@@ -375,4 +600,34 @@ function logMikroTikStartupError(error: unknown) {
   }
 
   console.error(`❌ Failed to initialize MikroTik client: ${String(error)}`);
+}
+
+function validateRuntimeConfig() {
+  if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+    throw new Error("PORT must be a valid TCP port");
+  }
+  if (!Number.isInteger(MIKROTIK_PORT) || MIKROTIK_PORT < 1 || MIKROTIK_PORT > 65535) {
+    throw new Error("MIKROTIK_PORT must be a valid TCP port");
+  }
+
+  if (process.env.NODE_ENV === "production") {
+    if (!process.env.DATABASE_URL) {
+      throw new Error("DATABASE_URL must be configured in production");
+    }
+    if (
+      !process.env.MIKROTIK_HOST ||
+      !process.env.MIKROTIK_USER ||
+      !process.env.MIKROTIK_PASSWORD ||
+      MIKROTIK_PASSWORD === "password"
+    ) {
+      throw new Error(
+        "Secure MikroTik host and credentials must be configured in production"
+      );
+    }
+  }
+}
+
+function logSyncError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`❌ MikroTik device synchronization failed: ${message}`);
 }

@@ -4,6 +4,113 @@ import { UserService } from "./userService";
 import { getMikroTikClient, type HotspotSession } from "../mikrotik/client";
 
 export class DeviceService {
+  private static syncPromise: Promise<HotspotSession[]> | null = null;
+
+  static async syncAllActiveSessions(): Promise<HotspotSession[]> {
+    if (!this.syncPromise) {
+      this.syncPromise = this.performActiveSessionSync().finally(() => {
+        this.syncPromise = null;
+      });
+    }
+
+    return this.syncPromise;
+  }
+
+  private static async performActiveSessionSync(): Promise<HotspotSession[]> {
+    const [users, devices, sessions] = await Promise.all([
+      UserService.getAllUsers(),
+      DeviceQueries.getAll(),
+      getMikroTikClient().getActiveConnections(),
+    ]);
+    const usersByName = new Map(
+      users.map((user) => [user.username.toLowerCase(), user])
+    );
+    const devicesByOwnerAndMac = new Map(
+      devices.map((device) => [
+        `${device.userId}:${normalizeMac(device.macAddress)}`,
+        device,
+      ])
+    );
+    const activeDeviceIds = new Set<string>();
+    const now = new Date().toISOString();
+
+    for (const session of uniqueSessionsByUserAndMac(sessions)) {
+      const user = usersByName.get(session.user.toLowerCase());
+      if (!user || user.role !== "user") continue;
+
+      const macAddress = normalizeMac(session.macAddress);
+      const key = `${user.id}:${macAddress}`;
+      const existing = devicesByOwnerAndMac.get(key);
+      const currentBytesIn = session.bytesIn || 0;
+      const currentBytesOut = session.bytesOut || 0;
+
+      if (!existing) {
+        const created = await DeviceQueries.create({
+          userId: user.id,
+          deviceName: automaticDeviceName(macAddress),
+          macAddress,
+          ipAddress: session.address,
+          isConnected: true,
+          connectedAt: now,
+          disconnectedAt: undefined,
+          lastSeenAt: now,
+          bytesIn: currentBytesIn,
+          bytesOut: currentBytesOut,
+          lastSessionId: session.id,
+          lastSessionBytesIn: currentBytesIn,
+          lastSessionBytesOut: currentBytesOut,
+          discoveredBy: "mikrotik",
+          createdAt: now,
+          updatedAt: now,
+        });
+        activeDeviceIds.add(created.id);
+        devicesByOwnerAndMac.set(key, created);
+        await AuditLogQueries.log(
+          user.id,
+          "DEVICE_AUTO_DISCOVERED",
+          `MAC: ${macAddress}, IP: ${session.address || ""}`,
+          "mikrotik-sync"
+        );
+        continue;
+      }
+
+      const sameSession = existing.lastSessionId === session.id;
+      const bytesInDelta = sameSession
+        ? Math.max(currentBytesIn - existing.lastSessionBytesIn, 0)
+        : currentBytesIn;
+      const bytesOutDelta = sameSession
+        ? Math.max(currentBytesOut - existing.lastSessionBytesOut, 0)
+        : currentBytesOut;
+      const updated = await DeviceQueries.update(existing.id, {
+        ipAddress: session.address || existing.ipAddress,
+        isConnected: true,
+        connectedAt: sameSession ? existing.connectedAt || now : now,
+        disconnectedAt: undefined,
+        lastSeenAt: now,
+        bytesIn: existing.bytesIn + bytesInDelta,
+        bytesOut: existing.bytesOut + bytesOutDelta,
+        lastSessionId: session.id,
+        lastSessionBytesIn: currentBytesIn,
+        lastSessionBytesOut: currentBytesOut,
+      });
+      if (updated) {
+        activeDeviceIds.add(updated.id);
+        devicesByOwnerAndMac.set(key, updated);
+      }
+    }
+
+    for (const device of devices) {
+      if (device.isConnected && !activeDeviceIds.has(device.id)) {
+        await DeviceQueries.update(device.id, {
+          isConnected: false,
+          disconnectedAt: now,
+        });
+      }
+    }
+
+    return sessions;
+  }
+
   /**
    * Get live RouterOS sessions and limit utilization for a user.
    */
@@ -13,6 +120,7 @@ export class DeviceService {
       throw new Error("User not found");
     }
 
+    await this.syncAllActiveSessions();
     const devices = await DeviceQueries.getByUserId(userId);
     const registeredByMac = new Map(
       devices.map((device) => [normalizeMac(device.macAddress), device])
@@ -45,6 +153,8 @@ export class DeviceService {
         uptime: session.uptime,
         bytesIn: session.bytesIn || 0,
         bytesOut: session.bytesOut || 0,
+        totalBytesIn: device?.bytesIn || session.bytesIn || 0,
+        totalBytesOut: device?.bytesOut || session.bytesOut || 0,
       };
     });
 
@@ -69,13 +179,7 @@ export class DeviceService {
       await this.resolveMacAddress(userId, payload, requestIp)
     );
 
-    // Check if user can add more devices
-    if (!(await UserService.canAddMoreDevices(userId))) {
-      throw new Error("User has reached maximum device limit");
-    }
-
-    // Check if MAC address is already in use
-    const existing = await DeviceQueries.getByMacAddress(macAddress);
+    const existing = await DeviceQueries.getByUserIdAndMac(userId, macAddress);
     if (existing) {
       throw new Error("MAC address already registered");
     }
@@ -84,9 +188,14 @@ export class DeviceService {
     const now = new Date().toISOString();
     const device = await DeviceQueries.create({
       userId,
-      deviceName: payload.deviceName,
+      deviceName: payload.deviceName.trim(),
       macAddress,
       isConnected: false,
+      bytesIn: 0,
+      bytesOut: 0,
+      lastSessionBytesIn: 0,
+      lastSessionBytesOut: 0,
+      discoveredBy: "manual",
       createdAt: now,
       updatedAt: now,
     });
@@ -147,7 +256,7 @@ export class DeviceService {
    * Get all devices for a user
    */
   static async getUserDevices(userId: string): Promise<Device[]> {
-    await this.syncUserSessions(userId);
+    await this.syncAllActiveSessions();
     return DeviceQueries.getByUserId(userId);
   }
 
@@ -161,6 +270,13 @@ export class DeviceService {
   ): Promise<Device | null> {
     const device = await DeviceQueries.getById(deviceId);
     if (!device) return null;
+
+    if (updates.deviceName !== undefined) {
+      updates.deviceName = updates.deviceName.trim();
+    }
+    if (updates.macAddress !== undefined) {
+      updates.macAddress = normalizeMac(updates.macAddress);
+    }
 
     // If updating MAC address, check for conflicts
     if (updates.macAddress && updates.macAddress !== device.macAddress) {
@@ -209,8 +325,8 @@ export class DeviceService {
     requestIp: string
   ): Promise<Device | null> {
     const normalizedMac = normalizeMac(macAddress);
-    const device = await DeviceQueries.getByMacAddress(normalizedMac);
-    if (!device || device.userId !== userId) {
+    const device = await DeviceQueries.getByUserIdAndMac(userId, normalizedMac);
+    if (!device) {
       return null; // Device not found or doesn't belong to user
     }
 
@@ -274,7 +390,8 @@ export class DeviceService {
    * Get connected devices for a user
    */
   static async getConnectedDevices(userId: string): Promise<Device[]> {
-    const devices = await this.syncUserSessions(userId);
+    await this.syncAllActiveSessions();
+    const devices = await DeviceQueries.getByUserId(userId);
     return devices.filter((d) => d.isConnected);
   }
 
@@ -312,27 +429,7 @@ export class DeviceService {
 
     const mikrotik = getMikroTikClient();
     const devices = await DeviceQueries.getByUserId(userId);
-    const registeredMacs = new Set(
-      devices.map((device) => normalizeMac(device.macAddress))
-    );
     let sessions = await mikrotik.getActiveConnectionsForUser(user.username);
-
-    const unauthorizedSessions = sessions.filter(
-      (session) => !registeredMacs.has(normalizeMac(session.macAddress))
-    );
-    for (const session of unauthorizedSessions) {
-      await mikrotik.disconnectSession(session.id);
-      await AuditLogQueries.log(
-        userId,
-        "UNREGISTERED_SESSION_DISCONNECTED",
-        `MAC: ${session.macAddress}, IP: ${session.address || ""}`,
-        requestIp
-      );
-    }
-
-    sessions = sessions.filter((session) =>
-      registeredMacs.has(normalizeMac(session.macAddress))
-    );
 
     const excessSessions = this.getExcessSessions(sessions, user.maxDevices);
     for (const session of excessSessions) {
@@ -354,7 +451,7 @@ export class DeviceService {
       );
     }
 
-    await this.syncUserSessions(userId);
+    await this.syncAllActiveSessions();
   }
 
   /**
@@ -365,46 +462,8 @@ export class DeviceService {
   }
 
   private static async syncUserSessions(userId: string): Promise<Device[]> {
-    const user = await UserService.getUser(userId);
-    if (!user) return [];
-
-    const devices = await DeviceQueries.getByUserId(userId);
-    const sessions = await getMikroTikClient().getActiveConnectionsForUser(
-      user.username
-    );
-    const activeByMac = new Map(
-      sessions.map((session) => [normalizeMac(session.macAddress), session])
-    );
-
-    const synced: Device[] = [];
-    for (const device of devices) {
-      const session = activeByMac.get(normalizeMac(device.macAddress));
-      const shouldBeConnected = Boolean(session);
-
-      if (
-        device.isConnected !== shouldBeConnected ||
-        (session?.address && device.ipAddress !== session.address)
-      ) {
-        const updated = await DeviceQueries.update(device.id, {
-          isConnected: shouldBeConnected,
-          ipAddress: session?.address || device.ipAddress,
-          connectedAt: shouldBeConnected
-            ? device.connectedAt || new Date().toISOString()
-            : device.connectedAt,
-          disconnectedAt: shouldBeConnected
-            ? undefined
-            : device.disconnectedAt || new Date().toISOString(),
-        });
-        if (updated) {
-          synced.push(updated);
-          continue;
-        }
-      }
-
-      synced.push(device);
-    }
-
-    return synced;
+    await this.syncAllActiveSessions();
+    return DeviceQueries.getByUserId(userId);
   }
 
   private static getExcessSessions(
@@ -432,6 +491,29 @@ function normalizeMac(macAddress: string): string {
 
 function uniqueMacs(macAddresses: string[]): string[] {
   return [...new Set(macAddresses.map(normalizeMac).filter(Boolean))];
+}
+
+function uniqueSessionsByUserAndMac(
+  sessions: HotspotSession[]
+): HotspotSession[] {
+  const unique = new Map<string, HotspotSession>();
+  for (const session of sessions) {
+    const key = `${session.user.toLowerCase()}:${normalizeMac(
+      session.macAddress
+    )}`;
+    const existing = unique.get(key);
+    if (
+      !existing ||
+      uptimeToSeconds(session.uptime) > uptimeToSeconds(existing.uptime)
+    ) {
+      unique.set(key, session);
+    }
+  }
+  return [...unique.values()];
+}
+
+function automaticDeviceName(macAddress: string): string {
+  return `Device ${macAddress.replace(/:/g, "").slice(-6)}`;
 }
 
 function uptimeToSeconds(uptime?: string): number {
