@@ -53,6 +53,7 @@ bun run dev
 
 ### Device Endpoints
 - `GET /api/devices` - Get user's devices
+- `GET /api/devices/sessions` - Monitor live HotSpot sessions and limit usage
 - `POST /api/devices` - Register new device
 - `POST /api/devices/connect` - Connect device (login)
 - `POST /api/devices/:deviceId/disconnect` - Disconnect device
@@ -80,13 +81,43 @@ src/
 ## Key Features
 
 ### Device Limitation
-Each user is limited to **2 simultaneously connected devices**. Active sessions are read from MikroTik Hotspot, grouped by MAC address, and excess sessions are disconnected on the router before the backend state is synced.
+Each user defaults to **2 simultaneously connected devices**. Registration creates an API-managed MikroTik HotSpot user profile such as `api-devices-2`, with RouterOS `shared-users` set to the account's `maxDevices`. This makes the router enforce the limit even when a client logs in directly through the captive portal without calling the backend first.
+
+Changing `maxDevices` moves the HotSpot user to the matching profile and disconnects excess live sessions.
+
+### Live Session Monitoring
+`GET /api/devices/sessions` reads `/ip hotspot active` and returns the current limit, unique active device count, remaining slots, MAC/IP addresses, uptime, traffic counters, and whether each MAC is registered:
+
+```json
+{
+  "success": true,
+  "data": {
+    "maxDevices": 2,
+    "activeDevices": 1,
+    "remainingDevices": 1,
+    "limitExceeded": false,
+    "sessions": [
+      {
+        "deviceName": "Phone",
+        "registered": true,
+        "macAddress": "AA:BB:CC:DD:EE:FF",
+        "ipAddress": "10.5.50.10",
+        "uptime": "12m30s",
+        "bytesIn": 12000,
+        "bytesOut": 45000
+      }
+    ]
+  }
+}
+```
 
 ### Device Registration
 Device registration accepts a `deviceName` plus optional `macAddress` or `ipAddress`. If `macAddress` is omitted, the API detects it from the user's current MikroTik Hotspot active session or router network tables, preferring the request IP when available.
 
 ### Authentication Separation
 JWT login authenticates access to this API only. MikroTik Hotspot authentication is provisioned separately through the router; registration accepts an optional `hotspotPassword` for that credential.
+
+Usernames are trimmed and stored in lowercase because MikroTik HotSpot usernames are case-sensitive. API login accepts any username casing and normalizes it before lookup.
 
 ### User Passwords
 Each user receives a **unique password** which is:
@@ -128,6 +159,18 @@ DATABASE_URL=postgres://mikrotik:mikrotik@localhost:5432/mikrotik
 4. Configure IP pool for hotspot clients
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed setup.
+
+## TP-Link Access Point Topology
+
+The TP-Link must operate as a transparent access point, not as a router:
+
+1. Connect a MikroTik HotSpot LAN/bridge port to a TP-Link LAN port.
+2. Set the TP-Link to **Access Point mode**.
+3. Disable DHCP server, NAT, guest-network isolation, and router/WISP mode on the TP-Link.
+4. Give the TP-Link a management IP inside the MikroTik LAN, outside the DHCP pool.
+5. Run DHCP, gateway, DNS, captive portal, and internet access control on MikroTik.
+
+If the TP-Link performs NAT, MikroTik may see the TP-Link instead of individual client MAC addresses, which prevents accurate per-device monitoring and limits.
 
 ## API Authentication
 
@@ -219,7 +262,7 @@ Logs are output to console. Configure `LOG_LEVEL` in `.env`
 # Register user
 curl -X POST http://localhost:3000/api/auth/register \
   -H "Content-Type: application/json" \
-  -d '{"username":"test","email":"test@test.com","password":"Test123456"}'
+  -d '{"username":"test","email":"test@test.com","password":"Test123456","hotspotPassword":"WiFiPass123","maxDevices":2}'
 
 # Login
 curl -X POST http://localhost:3000/api/auth/login \
@@ -228,6 +271,10 @@ curl -X POST http://localhost:3000/api/auth/login \
 
 # Get profile (replace TOKEN with actual token)
 curl -X GET http://localhost:3000/api/users/me \
+  -H "Authorization: Bearer TOKEN"
+
+# Monitor live HotSpot sessions
+curl -X GET http://localhost:3000/api/devices/sessions \
   -H "Authorization: Bearer TOKEN"
 ```
 

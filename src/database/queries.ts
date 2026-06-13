@@ -46,7 +46,7 @@ export const UserQueries = {
   getByUsername: async (username: string): Promise<User | null> => {
     const db = getDatabase();
     const [row] = await db<User[]>`
-      SELECT * FROM users WHERE username = ${username}
+      SELECT * FROM users WHERE LOWER(username) = LOWER(${username})
     `;
     return mapUser(row);
   },

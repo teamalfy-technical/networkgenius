@@ -10,6 +10,26 @@ type RouteContext = Omit<Context, "params"> & {
 
 export const deviceRoutes = {
   /**
+   * Get live HotSpot session usage for the current user
+   * GET /api/devices/sessions
+   */
+  getSessionStatus: async (context: Context) => {
+    try {
+      const user = getCurrentUser(context);
+      if (!user) {
+        context.set.status = 401;
+        return errorResponse("Unauthorized");
+      }
+
+      const status = await DeviceService.getSessionStatus(user.userId);
+      return successResponse(status);
+    } catch (error: any) {
+      context.set.status = 500;
+      return errorResponse(error.message || "Failed to get active sessions");
+    }
+  },
+
+  /**
    * Register new device for user
    * POST /api/devices
    */

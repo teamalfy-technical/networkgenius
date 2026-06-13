@@ -11,8 +11,11 @@ export class UserService {
     payload: UserPayload,
     requestIp: string
   ): Promise<User> {
+    const maxDevices = validateDeviceLimit(payload.maxDevices ?? 2);
+    const username = normalizeUsername(payload.username);
+
     // Check if user already exists
-    const existing = await UserQueries.getByUsername(payload.username);
+    const existing = await UserQueries.getByUsername(username);
     if (existing) {
       throw new Error("Username already exists");
     }
@@ -28,33 +31,35 @@ export class UserService {
     // Create user in database
     const now = new Date().toISOString();
     const user = await UserQueries.create({
-      username: payload.username,
+      username,
       email: payload.email,
       passwordHash,
       isActive: true,
       createdAt: now,
       updatedAt: now,
-      maxDevices: payload.maxDevices || 2,
+      maxDevices,
     });
 
-    // Provision hotspot credentials separately from JWT/app authentication.
+    // A database account without matching HotSpot credentials cannot provide
+    // internet access, so roll it back when router provisioning fails.
     try {
       const mikrotik = getMikroTikClient();
+      const profile = await mikrotik.ensureDeviceLimitProfile(maxDevices);
       await mikrotik.createHotspotUser(
-        payload.username,
+        username,
         payload.hotspotPassword || payload.password,
-        "default"
+        profile
       );
     } catch (error) {
-      console.error("Failed to create hotspot user:", error);
-      // Don't throw - user is created in DB, MikroTik sync can be retried
+      await UserQueries.delete(user.id);
+      throw error;
     }
 
     // Log action
     await AuditLogQueries.log(
       user.id,
       "USER_CREATED",
-      `Username: ${payload.username}`,
+      `Username: ${username}`,
       requestIp
     );
 
@@ -72,7 +77,7 @@ export class UserService {
    * Get user by username
    */
   static async getUserByUsername(username: string): Promise<User | null> {
-    return UserQueries.getByUsername(username);
+    return UserQueries.getByUsername(normalizeUsername(username));
   }
 
   /**
@@ -82,7 +87,7 @@ export class UserService {
     username: string,
     password: string
   ): Promise<User | null> {
-    const user = await UserQueries.getByUsername(username);
+    const user = await UserQueries.getByUsername(normalizeUsername(username));
     if (!user) return null;
 
     if (!user.isActive) return null;
@@ -112,7 +117,22 @@ export class UserService {
       }
     }
 
+    if (updates.maxDevices !== undefined) {
+      updates.maxDevices = validateDeviceLimit(updates.maxDevices);
+      await getMikroTikClient().setHotspotUserDeviceLimit(
+        user.username,
+        updates.maxDevices
+      );
+    }
+
     const updated = await UserQueries.update(userId, updates);
+
+    if (updates.maxDevices !== undefined) {
+      await getMikroTikClient().enforceUserSessionLimit(
+        user.username,
+        updates.maxDevices
+      );
+    }
 
     await AuditLogQueries.log(
       userId,
@@ -267,4 +287,21 @@ export class UserService {
     const deviceCount = await DeviceQueries.countAllByUserId(userId);
     return deviceCount < user.maxDevices;
   }
+}
+
+function validateDeviceLimit(maxDevices: number): number {
+  if (!Number.isInteger(maxDevices) || maxDevices < 1) {
+    throw new Error("maxDevices must be a positive integer");
+  }
+
+  return maxDevices;
+}
+
+function normalizeUsername(username: string): string {
+  const normalized = username.trim().toLowerCase();
+  if (!normalized) {
+    throw new Error("Username is required");
+  }
+
+  return normalized;
 }

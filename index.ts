@@ -246,6 +246,21 @@ app.get("/api/devices/connected", ({ headers, store }) => {
   } as any);
 });
 
+// Get live HotSpot session usage
+app.get("/api/devices/sessions", ({ headers, store }) => {
+  const token = extractToken(headers.authorization);
+  if (!token || !verifyToken(token)) {
+    return errorResponse("Unauthorized");
+  }
+  setAuthenticatedUser(store, token);
+  return deviceRoutes.getSessionStatus({
+    params: {},
+    request: new Request("http://localhost"),
+    set: { status: 200 },
+    store,
+  } as any);
+});
+
 // Get device by ID
 app.get("/api/devices/:deviceId", ({ headers, params, store }) => {
   const token = extractToken(headers.authorization);
@@ -341,6 +356,7 @@ app.listen(PORT, () => {
   console.log(`   GET  /api/users/me - Get current user profile`);
   console.log(`   GET  /api/devices - Get user devices`);
   console.log(`   POST /api/devices - Register new device`);
+  console.log(`   GET  /api/devices/sessions - Monitor live HotSpot sessions`);
   console.log(`   POST /api/devices/connect - Connect device`);
   console.log(`   POST /api/devices/:deviceId/disconnect - Disconnect device`);
   console.log(`   DELETE /api/devices/:deviceId - Delete device`);

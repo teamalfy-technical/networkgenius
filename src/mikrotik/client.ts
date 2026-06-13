@@ -9,6 +9,8 @@ export interface HotspotSession {
   macAddress: string;
   address?: string;
   uptime?: string;
+  bytesIn?: number;
+  bytesOut?: number;
 }
 
 export class MikroTikError extends Error {
@@ -103,6 +105,58 @@ export class MikroTikClient {
       return true;
     } catch (error) {
       throw toMikroTikError("create hotspot user", error);
+    }
+  }
+
+  /**
+   * Create or update an API-managed profile that enforces concurrent logins.
+   */
+  async ensureDeviceLimitProfile(maxDevices: number): Promise<string> {
+    const limit = validateDeviceLimit(maxDevices);
+    const profileName = `api-devices-${limit}`;
+
+    try {
+      const menu = this.getApi().menu("/ip hotspot user profile");
+      const profile = (await menu
+        .select(["id", "name", "sharedUsers"])
+        .where("name", profileName)
+        .getOnly()) as RouterOSItem | null;
+
+      if (!profile?.id) {
+        await menu.add({
+          name: profileName,
+          sharedUsers: limit,
+        });
+      } else if (Number(profile.sharedUsers) !== limit) {
+        await menu.update({ sharedUsers: limit }, profile.id);
+      }
+
+      return profileName;
+    } catch (error) {
+      throw toMikroTikError("ensure hotspot device limit profile", error);
+    }
+  }
+
+  /**
+   * Assign a HotSpot user to the profile matching their device limit.
+   */
+  async setHotspotUserDeviceLimit(
+    username: string,
+    maxDevices: number
+  ): Promise<boolean> {
+    try {
+      const profile = await this.ensureDeviceLimitProfile(maxDevices);
+      const user = await this.findHotspotUser(username);
+      if (!user?.id) {
+        throw new Error(`Hotspot user not found: ${username}`);
+      }
+
+      await this.getApi()
+        .menu("/ip hotspot user")
+        .update({ profile }, user.id);
+      return true;
+    } catch (error) {
+      throw toMikroTikError("set hotspot user device limit", error);
     }
   }
 
@@ -207,7 +261,15 @@ export class MikroTikClient {
     try {
       return await this.getApi()
         .menu("/ip hotspot active")
-        .select(["id", "user", "macAddress", "address", "uptime"])
+        .select([
+          "id",
+          "user",
+          "macAddress",
+          "address",
+          "uptime",
+          "bytesIn",
+          "bytesOut",
+        ])
         .get();
     } catch (error) {
       throw toMikroTikError("get active connections", error);
@@ -218,7 +280,15 @@ export class MikroTikClient {
     try {
       const sessions = (await this.getApi()
         .menu("/ip hotspot active")
-        .select(["id", "user", "macAddress", "address", "uptime"])
+        .select([
+          "id",
+          "user",
+          "macAddress",
+          "address",
+          "uptime",
+          "bytesIn",
+          "bytesOut",
+        ])
         .where("user", username)
         .get()) as RouterOSItem[];
 
@@ -230,6 +300,8 @@ export class MikroTikClient {
           macAddress: session.macAddress,
           address: session.address,
           uptime: session.uptime,
+          bytesIn: Number(session.bytesIn || 0),
+          bytesOut: Number(session.bytesOut || 0),
         }));
     } catch (error) {
       throw toMikroTikError("get active connections for user", error);
@@ -354,6 +426,39 @@ export class MikroTikClient {
     } catch (error) {
       throw toMikroTikError("disconnect hotspot MAC", error);
     }
+  }
+
+  /**
+   * Keep the longest-running session per device and remove sessions over limit.
+   */
+  async enforceUserSessionLimit(
+    username: string,
+    maxDevices: number
+  ): Promise<HotspotSession[]> {
+    const limit = validateDeviceLimit(maxDevices);
+    const sessions = await this.getActiveConnectionsForUser(username);
+    const byMac = new Map<string, HotspotSession>();
+
+    for (const session of sessions) {
+      const mac = normalizeMac(session.macAddress);
+      const existing = byMac.get(mac);
+      if (
+        !existing ||
+        uptimeToSeconds(session.uptime) > uptimeToSeconds(existing.uptime)
+      ) {
+        byMac.set(mac, session);
+      }
+    }
+
+    const excess = [...byMac.values()]
+      .sort((a, b) => uptimeToSeconds(b.uptime) - uptimeToSeconds(a.uptime))
+      .slice(limit);
+
+    for (const session of excess) {
+      await this.disconnectSession(session.id);
+    }
+
+    return excess;
   }
 
   /**
@@ -503,6 +608,31 @@ function formatDiagnostic(error: unknown): string {
 
 function normalizeMac(macAddress: string): string {
   return macAddress.trim().toUpperCase();
+}
+
+function validateDeviceLimit(maxDevices: number): number {
+  if (!Number.isInteger(maxDevices) || maxDevices < 1) {
+    throw new Error("Device limit must be a positive integer");
+  }
+
+  return maxDevices;
+}
+
+function uptimeToSeconds(uptime?: string): number {
+  if (!uptime) return 0;
+
+  let seconds = 0;
+  for (const match of uptime.matchAll(/(\d+)([wdhms])/g)) {
+    const value = Number(match[1]);
+    const unit = match[2];
+    if (unit === "w") seconds += value * 7 * 24 * 60 * 60;
+    if (unit === "d") seconds += value * 24 * 60 * 60;
+    if (unit === "h") seconds += value * 60 * 60;
+    if (unit === "m") seconds += value * 60;
+    if (unit === "s") seconds += value;
+  }
+
+  return seconds;
 }
 
 // Export singleton instance manager

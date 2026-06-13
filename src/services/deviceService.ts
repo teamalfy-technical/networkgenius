@@ -5,6 +5,59 @@ import { getMikroTikClient, type HotspotSession } from "../mikrotik/client";
 
 export class DeviceService {
   /**
+   * Get live RouterOS sessions and limit utilization for a user.
+   */
+  static async getSessionStatus(userId: string) {
+    const user = await UserService.getUser(userId);
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const devices = await DeviceQueries.getByUserId(userId);
+    const registeredByMac = new Map(
+      devices.map((device) => [normalizeMac(device.macAddress), device])
+    );
+    const sessions = await getMikroTikClient().getActiveConnectionsForUser(
+      user.username
+    );
+    const uniqueSessions = new Map<string, HotspotSession>();
+
+    for (const session of sessions) {
+      const mac = normalizeMac(session.macAddress);
+      const existing = uniqueSessions.get(mac);
+      if (
+        !existing ||
+        uptimeToSeconds(session.uptime) > uptimeToSeconds(existing.uptime)
+      ) {
+        uniqueSessions.set(mac, session);
+      }
+    }
+
+    const activeSessions = [...uniqueSessions.values()].map((session) => {
+      const device = registeredByMac.get(normalizeMac(session.macAddress));
+      return {
+        sessionId: session.id,
+        deviceId: device?.id,
+        deviceName: device?.deviceName,
+        registered: Boolean(device),
+        macAddress: normalizeMac(session.macAddress),
+        ipAddress: session.address,
+        uptime: session.uptime,
+        bytesIn: session.bytesIn || 0,
+        bytesOut: session.bytesOut || 0,
+      };
+    });
+
+    return {
+      maxDevices: user.maxDevices,
+      activeDevices: activeSessions.length,
+      remainingDevices: Math.max(user.maxDevices - activeSessions.length, 0),
+      limitExceeded: activeSessions.length > user.maxDevices,
+      sessions: activeSessions,
+    };
+  }
+
+  /**
    * Register a device for a user
    */
   static async registerDevice(
